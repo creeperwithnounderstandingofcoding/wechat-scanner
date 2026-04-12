@@ -1881,8 +1881,8 @@ function simpleMarkdown(text) {
     .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
     .replace(/^- (.+)$/gm, '<div style="padding-left:16px;">&#8226; $1</div>')
     .replace(/^---$/gm, '<hr style="border:none;border-top:1px solid #E8E5E0;margin:16px 0;">')
-    .replace(/\n\n/g, '<br><br>')
-    .replace(/\n/g, '<br>');
+    .replace(/\\n\\n/g, '<br><br>')
+    .replace(/\\n/g, '<br>');
   return html;
 }
 
