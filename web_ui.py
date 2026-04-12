@@ -668,7 +668,7 @@ td.num { text-align: center; }
 .btn-danger:hover:not(:disabled) { background: #B91C1C; }
 
 /* 日志 */
-.log-box { background: #1A1A1A; color: #A3E635; border-radius: 10px; padding: 16px; font-family: "Menlo", "SF Mono", monospace; font-size: 12px; height: 200px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
+.log-box { background: #FAF9F7; color: #374151; border: 1px solid #E8E5E0; border-radius: 10px; padding: 16px; font-family: "Menlo", "SF Mono", monospace; font-size: 12px; height: 200px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
 
 /* 结果 */
 .result-item { border-left: 4px solid #D97706; padding: 14px 18px; margin: 10px 0; background: #FAFAF8; border-radius: 0 10px 10px 0; position: relative; transition: opacity 0.4s, transform 0.4s; border: 1px solid #E8E5E0; border-left: 4px solid #D97706; }
@@ -828,7 +828,7 @@ td.num { text-align: center; }
           <div class="step-body" id="body-keys">
             <p>打开「终端 App」，粘贴以下命令并回车：</p>
             <div style="display:flex;align-items:center;gap:8px;margin:10px 0;">
-              <code id="extract-cmd" style="flex:1;background:#1A1A1A;color:#A3E635;padding:10px 14px;border-radius:8px;font-size:13px;word-break:break-all;"></code>
+              <code id="extract-cmd" style="flex:1;background:#FAF9F7;color:#374151;border:1px solid #E8E5E0;padding:10px 14px;border-radius:8px;font-size:13px;word-break:break-all;"></code>
               <button onclick="copyCmd()" class="btn-sm" style="background:#D97706;color:#fff;white-space:nowrap;">复制</button>
             </div>
             <p style="color:#6B6B6B;font-size:12px;">需要输入 Mac 开机密码。提取完成后回到这里点击"检查状态"。</p>
@@ -998,8 +998,8 @@ td.num { text-align: center; }
         <!-- 命令预览 — 可折叠 -->
         <details style="margin-bottom:16px;text-align:left;">
           <summary style="font-size:12px;color:#6B6B6B;cursor:pointer;text-align:center;">查看命令内容</summary>
-          <div style="background:#1A1A1A;border-radius:8px;padding:10px 14px;margin-top:8px;position:relative;">
-            <code style="color:#A3E635;font-size:11px;font-family:'SF Mono',Menlo,monospace;word-break:break-all;">curl -sL https://scanner.helioratech.com/api/wechat_script | bash</code>
+          <div style="background:#FAF9F7;border:1px solid #E8E5E0;border-radius:8px;padding:10px 14px;margin-top:8px;position:relative;">
+            <code style="color:#374151;font-size:11px;font-family:'SF Mono',Menlo,monospace;word-break:break-all;">curl -sL https://scanner.helioratech.com/api/wechat_script | bash</code>
             <button onclick="reCopy()" id="wx-recopy"
                     style="position:absolute;top:7px;right:8px;background:#44403C;color:#fff;border:none;border-radius:5px;padding:3px 10px;font-size:11px;cursor:pointer;">
               复制
