@@ -1,0 +1,33 @@
+# Environment and secrets
+.env
+.env.*
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+
+# Data and logs
+data/
+*.log
+*.db
+wechat_scanner.log
+
+# WeChat data (sensitive)
+wechat-decrypt/
+all_keys.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Wiki (stored on server)
+wiki/
