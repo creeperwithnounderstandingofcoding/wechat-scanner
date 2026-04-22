@@ -11,8 +11,8 @@
 
 前置步骤：
   1. sudo codesign --force --deep --sign - /Applications/WeChat.app
-  2. cd ~/Desktop/feishu/wechat-decrypt && sudo ./find_all_keys_macos
-  3. python decrypt_db.py
+  2. cd wechat-decrypt && sudo ./find_all_keys_macos
+  3. cd wechat-decrypt && python3 decrypt_db.py
 
 流程：
   1. 读取解密后的 DB（联系人、会话、消息）
@@ -55,12 +55,13 @@ def check_environment() -> list[str]:
 
     db_dir = config.DECRYPTED_DB_DIR
     if not db_dir.exists():
+        decrypt_dir = config.WECHAT_DECRYPT_DIR
         issues.append(
             f"解密数据库目录不存在: {db_dir}\n"
             "  请先运行 wechat-decrypt 工具解密数据库:\n"
-            "  1. cd ~/Desktop/feishu/wechat-decrypt\n"
+            f"  1. cd {decrypt_dir}\n"
             "  2. sudo ./find_all_keys_macos\n"
-            "  3. python decrypt_db.py"
+            "  3. python3 decrypt_db.py"
         )
         return issues
 

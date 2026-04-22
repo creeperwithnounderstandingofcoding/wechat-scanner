@@ -296,6 +296,50 @@ def health():
     return resp
 
 
+# ============================================================
+# 一次性安装 token（保护 /api/wechat_script 中的 API key）
+# ============================================================
+# curl 命令没带 session cookie，所以要在 URL 里塞一次性 token。
+# 浏览器登录用户点击"一键启动"按钮时：
+#   1. JS fetch POST /api/wechat_install_token → 拿到 token（基于 session 发放）
+#   2. JS 构造 curl 命令，URL 带 ?install_token=XXX
+#   3. 用户复制到终端 → curl 命令带 token → server 校验
+# 一次用完即失效，5 分钟过期。
+_INSTALL_TOKENS: dict[str, float] = {}
+_INSTALL_TOKEN_LOCK = threading.Lock()
+_INSTALL_TOKEN_TTL = 300  # 5 分钟
+
+
+def _issue_install_token() -> str:
+    tok = secrets.token_urlsafe(32)
+    now = time.time()
+    with _INSTALL_TOKEN_LOCK:
+        # 顺便 GC 过期 token
+        for k in list(_INSTALL_TOKENS.keys()):
+            if _INSTALL_TOKENS[k] < now:
+                del _INSTALL_TOKENS[k]
+        _INSTALL_TOKENS[tok] = now + _INSTALL_TOKEN_TTL
+    return tok
+
+
+def _consume_install_token(tok: str) -> bool:
+    if not tok:
+        return False
+    now = time.time()
+    with _INSTALL_TOKEN_LOCK:
+        exp = _INSTALL_TOKENS.pop(tok, 0)
+        return exp > now
+
+
+@app.route("/api/wechat_install_token", methods=["POST"])
+def api_wechat_install_token():
+    """浏览器登录后，JS 调这个拿一次性 token 塞到 curl 命令里。"""
+    if SERVER_MODE and not session.get("user_open_id"):
+        return jsonify({"ok": False, "error": "未登录"}), 401
+    tok = _issue_install_token()
+    return jsonify({"ok": True, "token": tok, "expires_in": _INSTALL_TOKEN_TTL})
+
+
 # ===== 微信解锁向导 API =====
 
 _WECHAT_DECRYPT_DIR = Path(os.getenv(
@@ -417,7 +461,7 @@ if [ ! -d "$SCAN_DIR" ] || [ ! -f "$SCAN_DIR/web_ui.py" ]; then
     mkdir -p "$HOME/Desktop/feishu" 2>/dev/null
     SCAN_DIR="$HOME/Desktop/feishu/wechat-scanner"
     if command -v git &>/dev/null; then
-        git clone https://github.com/helioratech/wechat-scanner.git "$SCAN_DIR" 2>/dev/null
+        git clone https://github.com/creeperwithnounderstandingofcoding/wechat-scanner.git "$SCAN_DIR" 2>/dev/null
     fi
     if [ ! -f "$SCAN_DIR/web_ui.py" ]; then
         echo "[错误] 无法下载项目。请联系管理员获取项目文件。"
@@ -479,70 +523,310 @@ $PY web_ui.py --port 5678 --no-browser
 
 @app.route("/api/wechat_script")
 def wechat_script():
-    """供 curl | bash 使用的启动脚本，纯文本，无需下载文件。"""
+    """供 curl | bash 使用的一键部署脚本。
+
+    SERVER_MODE 下要求登录（保护脚本中的敏感凭证：飞书 AppSecret + Anthropic key）。
+    所有敏感值从 server 环境变量读，不入源代码。"""
     from flask import Response
-    script = '''#!/bin/bash
-# 微信扫描工作台 — 一键启动
+
+    # SERVER_MODE 下必须通过 session 或一次性 install_token 验证
+    # （脚本里含 API key，HTTPS 单播给已登录用户）
+    if SERVER_MODE:
+        logged_in = bool(session.get("user_open_id"))
+        tok_ok = _consume_install_token(request.args.get("install_token", ""))
+        if not (logged_in or tok_ok):
+            return Response(
+                "#!/bin/bash\n"
+                "echo '[错误] 缺少授权。请在浏览器打开 scanner.helioratech.com，登录后点击\"一键启动\"按钮获取命令。'\n"
+                "exit 1\n",
+                mimetype='text/plain; charset=utf-8',
+                status=401,
+            )
+
+    # 从 server env 读敏感配置（部署时 export 到服务进程）。
+    # 这样 git 仓库里没 key，只有 scanner.helioratech.com 这一台机器持有。
+    inject_feishu_app_id = os.getenv("INJECT_FEISHU_APP_ID", FEISHU_APP_ID or "")
+    inject_feishu_app_secret = os.getenv("INJECT_FEISHU_APP_SECRET", FEISHU_APP_SECRET or "")
+    inject_anthropic_key = os.getenv("INJECT_ANTHROPIC_KEY", os.getenv("ANTHROPIC_API_KEY", ""))
+    inject_bitable_app_token = os.getenv("INJECT_BITABLE_APP_TOKEN", os.getenv("BITABLE_APP_TOKEN", ""))
+    inject_bitable_table_id = os.getenv("INJECT_BITABLE_TABLE_ID", os.getenv("BITABLE_TABLE_ID", ""))
+    inject_sourcing_table_id = os.getenv("INJECT_SOURCING_TABLE_ID", os.getenv("SOURCING_TABLE_ID", ""))
+
+    script = f'''#!/bin/bash
+# 微信扫描工作台 — 一键部署 + 启动
+# 幂等：可以重复跑，已装的不会重装
 set -e
 
-echo ""
-echo "========================================"
-echo "  微信扫描工作台 — 启动中..."
-echo "========================================"
-echo ""
-
-# 查找项目目录
+WX_DB_DIR="$HOME/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files"
 SCAN_DIR="$HOME/Desktop/feishu/wechat-scanner"
-if [ ! -d "$SCAN_DIR" ]; then
-    SCAN_DIR="$(find "$HOME" -maxdepth 3 -name "wechat-scanner" -type d 2>/dev/null | head -1)"
-fi
 
-# 如果项目不存在，尝试克隆
-if [ ! -d "$SCAN_DIR" ] || [ ! -f "$SCAN_DIR/web_ui.py" ]; then
-    echo "[!] 未找到项目目录，正在下载..."
-    mkdir -p "$HOME/Desktop/feishu" 2>/dev/null
-    SCAN_DIR="$HOME/Desktop/feishu/wechat-scanner"
-    if command -v git &>/dev/null; then
-        git clone https://github.com/helioratech/wechat-scanner.git "$SCAN_DIR" 2>/dev/null || true
-    fi
-    if [ ! -f "$SCAN_DIR/web_ui.py" ]; then
-        echo "[错误] 无法下载项目。请联系管理员获取项目文件。"
-        exit 1
-    fi
-fi
+echo ""
+echo "========================================"
+echo "  微信扫描工作台 — 一键部署"
+echo "========================================"
+echo ""
 
-cd "$SCAN_DIR"
-echo "[+] 项目目录: $SCAN_DIR"
+# ============================================================
+# 步骤 0: 系统前置检查
+# ============================================================
 
-# 检查 Python
-PY=$(command -v python3 2>/dev/null)
-if [ -z "$PY" ]; then
+# 0a. Xcode Command Line Tools（编译 find_all_keys_macos）
+if ! xcode-select -p &>/dev/null; then
+    echo "[!] 缺少 Xcode Command Line Tools，正在调起安装窗口..."
+    xcode-select --install 2>&1 || true
     echo ""
-    echo "[错误] 未找到 python3"
-    echo "  请安装: https://www.python.org/downloads/"
-    echo "  或运行: brew install python3"
+    echo "请在弹出的对话框中点击\\"安装\\"，完成后（大约 2-5 分钟）"
+    echo "**重新粘贴本命令** 继续。"
     exit 1
 fi
-echo "[+] Python: $($PY --version)"
 
-# 检查/安装依赖
-if ! $PY -c "import flask" 2>/dev/null; then
-    echo "[!] 首次运行，安装依赖中..."
-    pip3 install flask python-dotenv lark-oapi anthropic pycryptodome requests 2>&1 | tail -3
-    echo "[+] 依赖安装完成"
+# 0b. Full Disk Access（读 ~/Library/Containers 下的微信 DB）
+if ! ls "$WX_DB_DIR" &>/dev/null; then
+    cat <<'DOCEOF'
+
+========================================
+[!] 终端需要「完全磁盘访问权限」才能读取微信数据
+
+请按以下步骤操作：
+  1. 打开【系统设置 → 隐私与安全性 → 完全磁盘访问权限】
+     （正在为你自动打开）
+  2. 解锁（左下角 🔒）
+  3. 点 ➕，按 Cmd+Shift+G 输入：
+        /System/Applications/Utilities/Terminal.app
+  4. 勾上"终端"
+  5. **关闭并重新打开终端**，再重新粘贴本命令
+========================================
+DOCEOF
+    open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles" 2>/dev/null || true
+    exit 1
+fi
+echo "[✓] 完全磁盘访问 OK"
+
+# 0c. Node.js（lark-cli 依赖）
+if ! command -v node &>/dev/null || ! command -v npm &>/dev/null; then
+    echo "[错误] 未找到 node/npm（飞书扫描依赖）"
+    echo "  请安装 Node.js: https://nodejs.org/ 或 brew install node"
+    exit 1
+fi
+echo "[✓] Node.js $(node --version)"
+
+# 0d. Python 3
+PY=$(command -v python3)
+if [ -z "$PY" ]; then
+    echo "[错误] 未找到 python3"
+    exit 1
+fi
+echo "[✓] Python $($PY --version | awk '{{print $2}}')"
+
+# 0e. 微信正在运行
+if ! pgrep -x WeChat >/dev/null; then
+    echo ""
+    echo "[!] 微信未运行。请先启动微信并登录，然后重新粘贴本命令。"
+    echo "    （从内存里提取密钥，所以微信必须在跑）"
+    exit 1
+fi
+echo "[✓] 微信进程运行中 (PID $(pgrep -x WeChat))"
+
+echo ""
+echo "---- 步骤 1/7: 下载 / 更新项目 ----"
+if [ ! -d "$SCAN_DIR/.git" ]; then
+    mkdir -p "$(dirname "$SCAN_DIR")"
+    git clone --depth=1 https://github.com/creeperwithnounderstandingofcoding/wechat-scanner.git "$SCAN_DIR"
+else
+    (cd "$SCAN_DIR" && git pull --ff-only --quiet 2>&1 | tail -2) || true
+fi
+cd "$SCAN_DIR"
+echo "[✓] $SCAN_DIR"
+
+echo ""
+echo "---- 步骤 2/7: 下载 wechat-decrypt 解密工具 ----"
+if [ ! -d "wechat-decrypt/.git" ]; then
+    git clone --depth=1 https://github.com/ylytdeng/wechat-decrypt.git wechat-decrypt
+else
+    (cd wechat-decrypt && git pull --ff-only --quiet 2>&1 | tail -1) || true
 fi
 
 echo ""
-echo "[+] 启动本地服务: http://127.0.0.1:5678"
-echo "[+] 按 Ctrl+C 停止"
+echo "---- 步骤 3/7: 装 Python 依赖 ----"
+$PY -m pip install --user --quiet \\
+    flask python-dotenv lark-oapi anthropic pycryptodome zstandard requests 2>&1 | tail -3 || true
+echo "[✓] 依赖 OK"
+
+echo ""
+echo "---- 步骤 4/7: 编译密钥提取器 ----"
+cd wechat-decrypt
+if [ ! -f "find_all_keys_macos" ] || [ "find_all_keys_macos.c" -nt "find_all_keys_macos" ]; then
+    cc -O2 -o find_all_keys_macos find_all_keys_macos.c -framework Foundation
+    echo "[✓] 编译完成"
+else
+    echo "[✓] 已是最新"
+fi
+
+# 自动探测微信 wxid 账号目录
+WXID=$(ls "$WX_DB_DIR" 2>/dev/null | grep -E "^wxid_" | head -1)
+if [ -z "$WXID" ]; then
+    echo "[错误] 未探测到微信账号目录（wxid_*），请先登录微信 4.x"
+    exit 1
+fi
+DB_DIR_ABS="$WX_DB_DIR/$WXID/db_storage"
+cat > config.json <<CFGEOF
+{{
+    "db_dir": "$DB_DIR_ABS",
+    "keys_file": "all_keys.user.json",
+    "decrypted_dir": "decrypted",
+    "wechat_process": "WeChat"
+}}
+CFGEOF
+echo "[✓] 微信账号: $WXID"
+
+echo ""
+echo "---- 步骤 5/7: 提取密钥 + 解密数据库（需要输入 Mac 登录密码）----"
+# WeChat ad-hoc 签名（让 find_all_keys_macos 的 task_for_pid 能成功）
+echo "[*] 对 WeChat.app 做 ad-hoc 签名..."
+sudo -v  # 预收一次密码，减少后续弹框
+sudo codesign --force --deep --sign - /Applications/WeChat.app 2>/dev/null || true
+
+# 内存扫描拿 key（输出 20~40 个候选）
+sudo ./find_all_keys_macos > /tmp/wx_keys.log 2>&1 || true
+
+# Python fallback: 自己 walk db 匹配 salt → all_keys.user.json
+# （规避 C 二进制在 TCC 下可能扫不到 Containers、以及 all_keys.json 被 macl 锁）
+$PY - <<'PYEOF'
+import json, os, re
+log = open("/tmp/wx_keys.log").read()
+pairs = re.findall(r"^\\(unknown\\)\\s+([0-9a-f]{{64}})\\s+([0-9a-f]{{32}})\\s*$", log, re.M)
+# 也兼容已匹配的行（Database name + key + salt）
+for m in re.finditer(r"^\\S[\\S/]+\\.db\\s+([0-9a-f]{{64}})\\s+([0-9a-f]{{32}})\\s*$", log, re.M):
+    pairs.append((m.group(1), m.group(2)))
+print(f"[*] 从内存扫描提取 {{len(pairs)}} 个 key 候选")
+
+cfg = json.load(open("config.json"))
+db_dir = cfg["db_dir"]
+salt2rel = {{}}
+for root, _, files in os.walk(db_dir):
+    for f in files:
+        if not f.endswith(".db"): continue
+        p = os.path.join(root, f)
+        try:
+            with open(p, "rb") as fh:
+                head = fh.read(16)
+            if head.startswith(b"SQLite format 3"): continue
+            salt2rel[head.hex()] = os.path.relpath(p, db_dir)
+        except Exception:
+            pass
+
+result = {{}}
+for k, s in pairs:
+    rel = salt2rel.get(s)
+    if rel and rel not in result:
+        result[rel] = {{"enc_key": k}}
+result["_db_dir"] = db_dir
+# 写到 /tmp 再 cp 回来（macl 在 sudo 提权创建的文件上会锁死原文件）
+with open("/tmp/all_keys.user.json", "w") as f:
+    json.dump(result, f, indent=2)
+print(f"[✓] 匹配 {{len([k for k in result if not k.startswith('_')])}} 个加密 DB")
+PYEOF
+
+# 安全覆盖（rm 存在的老 macl 文件 + cp 新的）
+rm -f all_keys.user.json 2>/dev/null || true
+cp /tmp/all_keys.user.json all_keys.user.json
+rm -f /tmp/all_keys.user.json
+
+# 执行解密
+$PY decrypt_db.py 2>&1 | tail -6
+cd ..
+
+echo ""
+echo "---- 步骤 6/7: 生成 .env 配置 ----"
+if [ ! -f ".env" ]; then
+    SESSION_SEC=$($PY -c "import secrets; print(secrets.token_hex(32))")
+    cat > .env <<ENVEOF
+# === 自动生成于 $(date) —— 由 scanner.helioratech.com 下发 ===
+FEISHU_APP_ID={inject_feishu_app_id}
+FEISHU_APP_SECRET={inject_feishu_app_secret}
+OAUTH_REDIRECT_URI=http://127.0.0.1:5678/oauth/callback
+SESSION_SECRET=$SESSION_SEC
+REQUIRE_LOGIN=0
+SERVER_MODE=0
+
+# Anthropic（AI 分析）
+ANTHROPIC_API_KEY={inject_anthropic_key}
+ANTHROPIC_BASE_URL=https://api.anthropic.com
+
+# 多维表格（扫描结果写入）
+BITABLE_APP_TOKEN={inject_bitable_app_token}
+BITABLE_TABLE_ID={inject_bitable_table_id}
+SOURCING_TABLE_ID={inject_sourcing_table_id}
+
+# lark-cli（飞书扫描依赖，装完自动填）
+LARK_CLI_PATH=
+ENVEOF
+    echo "[✓] .env 已创建"
+else
+    echo "[✓] .env 已存在（保留你的自定义配置）"
+fi
+
+echo ""
+echo "---- 步骤 7/7: 装 lark-cli + 飞书授权（Device Flow）----"
+LARK_CLI_BIN=$(command -v lark-cli 2>/dev/null || true)
+if [ -z "$LARK_CLI_BIN" ]; then
+    echo "[*] 安装 @larksuite/cli ..."
+    npm install -g @larksuite/cli 2>&1 | tail -3
+    LARK_CLI_BIN=$(command -v lark-cli 2>/dev/null || echo "$(npm config get prefix)/bin/lark-cli")
+fi
+echo "[✓] lark-cli: $LARK_CLI_BIN"
+
+# 更新 .env 里的 LARK_CLI_PATH（macOS sed -i 需要 '' 参数）
+if grep -q "^LARK_CLI_PATH=" .env; then
+    sed -i '' "s|^LARK_CLI_PATH=.*|LARK_CLI_PATH=$LARK_CLI_BIN|" .env
+else
+    echo "LARK_CLI_PATH=$LARK_CLI_BIN" >> .env
+fi
+
+# lark-cli config init（幂等）
+if [ ! -f "$HOME/.lark-cli/config.json" ]; then
+    echo "{inject_feishu_app_secret}" | "$LARK_CLI_BIN" config init \\
+        --app-id {inject_feishu_app_id} --app-secret-stdin --brand feishu >/dev/null
+    echo "[✓] lark-cli 配置完成"
+fi
+
+# 检查 auth 状态，没 valid token 就走 device flow
+AUTH_STATE=$("$LARK_CLI_BIN" auth status 2>&1 | grep '"tokenStatus"' | head -1 || true)
+if ! echo "$AUTH_STATE" | grep -q '"valid"'; then
+    echo ""
+    echo "[*] 请求飞书授权（Device Flow）..."
+    DEV_OUT=$("$LARK_CLI_BIN" auth login --domain im,docs,drive,minutes --no-wait --json 2>&1)
+    URL=$(echo "$DEV_OUT" | $PY -c "import sys,json,re; t=sys.stdin.read(); m=re.search(r'\\"verification_url\\"\\s*:\\s*\\"([^\\"]+)\\"', t); print(m.group(1) if m else '')")
+    DC=$(echo "$DEV_OUT" | $PY -c "import sys,json,re; t=sys.stdin.read(); m=re.search(r'\\"device_code\\"\\s*:\\s*\\"([^\\"]+)\\"', t); print(m.group(1) if m else '')")
+    echo ""
+    echo "========================================"
+    echo "  请在浏览器中用飞书账号授权（会自动打开）"
+    echo ""
+    echo "  $URL"
+    echo "========================================"
+    open "$URL" 2>/dev/null || true
+    echo ""
+    echo "[*] 等你授权完成..."
+    "$LARK_CLI_BIN" auth login --device-code "$DC" >/dev/null && echo "[✓] 飞书授权完成"
+else
+    echo "[✓] 飞书 auth 已 valid"
+fi
+
+echo ""
+echo "========================================"
+echo "  ✅ 部署完成！启动扫描工作台..."
+echo "  浏览器会自动打开 http://127.0.0.1:5678"
+echo "  按 Ctrl+C 停止"
+echo "========================================"
 echo ""
 
-# 等本地服务就绪后，打开服务器页面（自动切换到微信扫描 tab）
-(sleep 3 && open "https://scanner.helioratech.com?tab=wechat") &
-
+(sleep 3 && open "http://127.0.0.1:5678") &
 $PY web_ui.py --port 5678 --no-browser
 '''
-    return Response(script, mimetype='text/plain; charset=utf-8')
+    resp = Response(script, mimetype='text/plain; charset=utf-8')
+    # 不被 CDN/代理缓存（user_open_id 变化 + key 是单播）
+    resp.headers["Cache-Control"] = "no-store, private"
+    return resp
 
 
 @app.route("/api/wechat_setup/reload", methods=["POST"])
@@ -999,7 +1283,7 @@ td.num { text-align: center; }
         <details style="margin-bottom:16px;text-align:left;">
           <summary style="font-size:12px;color:#6B6B6B;cursor:pointer;text-align:center;">查看命令内容</summary>
           <div style="background:#FAF9F7;border:1px solid #E8E5E0;border-radius:8px;padding:10px 14px;margin-top:8px;position:relative;">
-            <code style="color:#374151;font-size:11px;font-family:'SF Mono',Menlo,monospace;word-break:break-all;">curl -sL https://scanner.helioratech.com/api/wechat_script | bash</code>
+            <code style="color:#374151;font-size:11px;font-family:'SF Mono',Menlo,monospace;word-break:break-all;">curl -sL "https://scanner.helioratech.com/api/wechat_script?install_token=&lt;一次性令牌&gt;" | bash</code>
             <button onclick="reCopy()" id="wx-recopy"
                     style="position:absolute;top:7px;right:8px;background:#44403C;color:#fff;border:none;border-radius:5px;padding:3px 10px;font-size:11px;cursor:pointer;">
               复制
@@ -1009,7 +1293,7 @@ td.num { text-align: center; }
 
         <div id="wx-polling" style="display:flex;align-items:center;justify-content:center;gap:8px;">
           <div style="width:14px;height:14px;border:2px solid #D97706;border-top-color:transparent;border-radius:50%;animation:spin 0.8s linear infinite;"></div>
-          <span style="color:#6B6B6B;font-size:13px;">等待本地服务启动...</span>
+          <span style="color:#6B6B6B;font-size:13px;">启动后会自动在新标签页打开本地扫描页（127.0.0.1:5678），此页可关闭</span>
         </div>
       </div>
 
@@ -2222,30 +2506,46 @@ function showWxState(state) {
   }
 }
 
-const _wxCmd = 'curl -sL https://scanner.helioratech.com/api/wechat_script | bash';
+// 由 server 发放一次性 token，拼到 curl URL 里。token 5 分钟过期、用完即焚。
+let _wxCmdCache = '';
 
-function launchWx() {
-  // 1) 复制命令到剪贴板
-  navigator.clipboard.writeText(_wxCmd).then(() => {
-    // 2) 切换到「已复制」状态
-    showWxState('copied');
-    // 3) 开始轮询
-    startPolling();
-  }).catch(() => {
-    // fallback: 选中文本让用户手动复制
-    prompt('请复制以下命令到终端运行：', _wxCmd);
-    showWxState('copied');
-    startPolling();
-  });
+async function _buildWxCmd() {
+  try {
+    const r = await fetch('/api/wechat_install_token', {method: 'POST', credentials: 'include'});
+    const d = await r.json();
+    if (d && d.ok && d.token) {
+      _wxCmdCache = 'curl -sL "https://scanner.helioratech.com/api/wechat_script?install_token=' + d.token + '" | bash';
+      return _wxCmdCache;
+    }
+  } catch (e) {}
+  // 回退：无 token（本地模式或未登录，server 会自己决定放不放脚本）
+  _wxCmdCache = 'curl -sL https://scanner.helioratech.com/api/wechat_script | bash';
+  return _wxCmdCache;
 }
 
-function reCopy() {
-  navigator.clipboard.writeText(_wxCmd).then(() => {
+async function launchWx() {
+  const cmd = await _buildWxCmd();
+  try {
+    await navigator.clipboard.writeText(cmd);
+    showWxState('copied');
+    startPolling();
+  } catch (e) {
+    prompt('请复制以下命令到终端运行：', cmd);
+    showWxState('copied');
+    startPolling();
+  }
+}
+
+async function reCopy() {
+  // token 是一次性的，再复制要拿新的
+  const cmd = await _buildWxCmd();
+  try {
+    await navigator.clipboard.writeText(cmd);
     const btn = document.getElementById('wx-recopy');
     btn.textContent = '已复制 ✓';
     btn.style.background = '#16A34A';
     setTimeout(() => { btn.textContent = '再复制'; btn.style.background = '#333'; }, 1500);
-  });
+  } catch (e) {}
 }
 
 function startPolling() {

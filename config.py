@@ -14,10 +14,16 @@ WECHAT_DATA_ROOT = Path(os.getenv(
     ),
 ))
 
+# wechat-decrypt 工具目录（已集成到项目内）
+WECHAT_DECRYPT_DIR = Path(os.getenv(
+    "WECHAT_DECRYPT_DIR",
+    str(Path(__file__).resolve().parent / "wechat-decrypt"),
+))
+
 # 解密后的数据库目录（wechat-decrypt 工具输出）
 DECRYPTED_DB_DIR = Path(os.getenv(
     "DECRYPTED_DB_DIR",
-    os.path.expanduser("~/Desktop/feishu/wechat-decrypt/decrypted"),
+    str(WECHAT_DECRYPT_DIR / "decrypted"),
 ))
 
 # ===== 复用飞书 bot 的配置 =====

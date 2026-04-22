@@ -135,10 +135,10 @@ class ScannerCore:
 
     def _re_decrypt_dbs(self) -> str:
         """用现有密钥重新解密 DB + 合并 WAL。返回错误消息或空串。"""
-        decrypt_dir = Path.home() / "Desktop/feishu/wechat-decrypt"
+        decrypt_dir = Path(config.WECHAT_DECRYPT_DIR)
         keys_file = decrypt_dir / "all_keys.json"
         if not keys_file.exists():
-            return "密钥文件不存在，请先运行 find_all_keys_macos"
+            return f"密钥文件不存在，请先运行 sudo {decrypt_dir}/find_all_keys_macos"
 
         out_dir = config.DECRYPTED_DB_DIR
         for sub in ["message", "contact", "session"]:
