@@ -3034,10 +3034,41 @@ def api_save():
 
 @app.route("/api/feishu_chats")
 def api_feishu_chats():
-    """列出 bot 能访问的飞书群聊。"""
+    """列出当前登录用户能看到的飞书群聊（OAuth user_access_token，
+    不需要 bot 在群里）。未登录回退 bot 凭证。"""
     try:
+        # 优先：用登录用户的 OAuth token 列群（bot 不需要在群）
+        if session.get("user_access_token"):
+            try:
+                import sys, os as _os
+                bot_dir = _os.getenv("FEISHU_DEAL_BOT_DIR", "")
+                if bot_dir and bot_dir not in sys.path:
+                    sys.path.insert(0, bot_dir)
+                from services.feishu_user_read import FeishuUserReader
+                reader = FeishuUserReader(
+                    user_access_token=session["user_access_token"],
+                    refresh_token=session.get("user_refresh_token", ""),
+                    token_obtained_at=session.get("token_obtained_at", 0),
+                    expires_in=session.get("token_expires_in", 7200),
+                    on_token_refreshed=lambda **kw: _update_session_tokens(kw),
+                )
+                raw_chats = reader.list_chats(page_size=100)
+                # 归一化字段，与 bot client 返回 shape 对齐
+                chats = [{
+                    "chat_id": c.get("chat_id", ""),
+                    "name": c.get("name") or "(未命名)",
+                    "description": c.get("description", ""),
+                    "external": bool(c.get("external", False)),
+                    "owner_id": c.get("owner_id", ""),
+                    "avatar": c.get("avatar", ""),
+                } for c in (raw_chats or []) if c.get("chat_id")]
+                logger.info(f"[/api/feishu_chats] user_reader 列出 {len(chats)} 个群")
+                return jsonify({"ok": True, "chats": chats, "source": "user_oauth"})
+            except Exception as e:
+                logger.warning(f"[/api/feishu_chats] user_reader 失败，回退 bot: {e}")
+
         chats = core.list_feishu_chats()
-        return jsonify({"ok": True, "chats": chats})
+        return jsonify({"ok": True, "chats": chats, "source": "bot_app"})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
