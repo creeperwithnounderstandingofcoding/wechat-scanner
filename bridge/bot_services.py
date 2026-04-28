@@ -238,28 +238,45 @@ class BotBridge:
         progress_callback: Callable[[str], None],
         user_api=None,
     ) -> None:
-        """调用 bot 的 process_history_links 跑完整的 历史扫描 → AI → 入库 流程。
+        """调用 bot 的深度扫描 pipeline (streaming + memory)。
 
-        progress_callback 会被 bot 的 services 频繁调用，把 str 消息推给 caller。
-        caller 通常把这个 callback 挂到 SSE/队列上。
+        优先用 user_api（OAuth user_access_token）静默拉群消息，不需要 bot
+        在群里。bot client 仅用于 PDF 下载等需要租户凭证的操作。
 
-        user_api: 可选 FeishuUserAPI 实例。如果提供，本线程内所有 `--as user`
-                  的 lark-cli 调用会自动切换为直连 REST API（使用该用户的 OAuth token）。
+        所有进度/错误通过 progress_callback (DM owner)，从不 spam 群。
         """
         client = self._ensure_client()
         with _bot_import_context():
-            # 在 bot 目录下 + 隔离 config，现在 import 得到的是 bot 的
-            from services.history_scanner import process_history_links  # noqa: E402
+            from services.deep_scan_pipeline import run_deep_scan  # noqa: E402
+            from services.feishu_user_read import FeishuUserReader  # noqa: E402
             from services.minutes_service import set_user_api, clear_user_api  # noqa: E402
 
-            if user_api:
-                set_user_api(user_api)
-                logger.info("[Bridge] 使用登录用户的 OAuth token 进行 API 调用")
+            user_reader = None
+            if user_api is not None:
+                # 复用 user_api 上的 token 起一个 reader（不加 OAuth 流程，复用 session 里已有的 token）
+                try:
+                    user_reader = FeishuUserReader(
+                        user_access_token=getattr(user_api, "access_token", "") or "",
+                        refresh_token=getattr(user_api, "refresh_token", "") or "",
+                        token_obtained_at=getattr(user_api, "token_obtained_at", 0) or 0,
+                        expires_in=getattr(user_api, "expires_in", 7200) or 7200,
+                        on_token_refreshed=getattr(user_api, "on_token_refreshed", None),
+                    )
+                    set_user_api(user_api)
+                    logger.info("[Bridge] 启用 user_reader（不需要 bot 在群里）")
+                except Exception as e:
+                    logger.warning(f"[Bridge] user_reader 初始化失败，回退 bot client: {e}")
+                    user_reader = None
 
             try:
-                process_history_links(client, chat_id, progress_callback)
+                run_deep_scan(
+                    chat_id,
+                    progress_callback,
+                    user_reader=user_reader,
+                    bot_client=client,
+                )
             except Exception as e:
-                logger.exception(f"[Bridge] 扫描 {chat_id} 异常: {e}")
+                logger.exception(f"[Bridge] 深度扫描 {chat_id} 异常: {e}")
                 progress_callback(f"❌ 扫描异常: {e}")
                 raise
             finally:
