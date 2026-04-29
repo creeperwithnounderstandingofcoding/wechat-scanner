@@ -272,6 +272,20 @@ def oauth_callback():
     session["refresh_expires_in"] = token_data.get("refresh_expires_in", 2592000)
     import time
     session["token_obtained_at"] = int(time.time())
+
+    # 同步写到服务端 token_store（按 open_id 索引）— 后台扫描线程也能读到。
+    try:
+        from services import token_store
+        token_store.save(
+            open_id,
+            access_token=user_access_token,
+            refresh_token=token_data.get("refresh_token", ""),
+            expires_in=token_data.get("expires_in", 7200),
+            token_obtained_at=int(time.time()),
+            user_name=name,
+        )
+    except Exception as e:
+        logger.warning(f"[OAuth] token_store 写入失败 (非致命): {e}")
     session.pop("oauth_state", None)
     next_url = session.pop("post_login_redirect", "/")
     if not next_url.startswith("/"):
@@ -283,7 +297,14 @@ def oauth_callback():
 @app.route("/logout")
 def logout():
     user = session.get("user_name", "?")
+    open_id = session.get("user_open_id", "")
     session.clear()
+    if open_id:
+        try:
+            from services import token_store
+            token_store.clear(open_id)
+        except Exception as e:
+            logger.warning(f"[OAuth] token_store 清理失败 (非致命): {e}")
     logger.info(f"[OAuth] 登出: {user}")
     return redirect(url_for("login"))
 
@@ -3038,19 +3059,21 @@ def api_feishu_chats():
     不需要 bot 在群里）。未登录回退 bot 凭证。"""
     try:
         # 优先：用登录用户的 OAuth token 列群（bot 不需要在群）
-        if session.get("user_access_token"):
+        tokens = _load_user_tokens()
+        if tokens.get("access_token"):
             try:
                 import sys, os as _os
                 bot_dir = _os.getenv("FEISHU_DEAL_BOT_DIR", "")
                 if bot_dir and bot_dir not in sys.path:
                     sys.path.insert(0, bot_dir)
                 from services.feishu_user_read import FeishuUserReader
+                _open_id = tokens.get("open_id", "")
                 reader = FeishuUserReader(
-                    user_access_token=session["user_access_token"],
-                    refresh_token=session.get("user_refresh_token", ""),
-                    token_obtained_at=session.get("token_obtained_at", 0),
-                    expires_in=session.get("token_expires_in", 7200),
-                    on_token_refreshed=lambda **kw: _update_session_tokens(kw),
+                    user_access_token=tokens["access_token"],
+                    refresh_token=tokens.get("refresh_token", ""),
+                    token_obtained_at=tokens.get("token_obtained_at", 0),
+                    expires_in=tokens.get("expires_in", 7200),
+                    on_token_refreshed=lambda **kw: _update_session_tokens(kw, _open_id),
                 )
                 raw_chats = reader.list_chats(page_size=100)
                 # 归一化字段，与 bot client 返回 shape 对齐
@@ -3082,21 +3105,25 @@ def api_feishu_scan():
     if not chat_id:
         return jsonify({"ok": False, "error": "chat_id 必填"}), 400
 
-    # Phase E: 从 session 中构建当前登录用户的 API 实例
+    # Phase E: 从 token_store / session 中构建当前登录用户的 API 实例。
+    # 用 _load_user_tokens 优先取 store —— 后台扫描线程 refresh 过的最新值在那。
     user_api = None
-    if session.get("user_access_token"):
+    tokens = _load_user_tokens()
+    if tokens.get("access_token"):
         try:
             import sys, os
             bot_dir = os.getenv("FEISHU_DEAL_BOT_DIR", "")
             if bot_dir and bot_dir not in sys.path:
                 sys.path.insert(0, bot_dir)
             from services.feishu_api import FeishuUserAPI
+            _open_id = tokens.get("open_id", "")
             user_api = FeishuUserAPI(
-                access_token=session["user_access_token"],
-                refresh_token=session.get("user_refresh_token", ""),
-                token_obtained_at=session.get("token_obtained_at", 0),
-                expires_in=session.get("token_expires_in", 7200),
-                on_token_refreshed=lambda **kw: _update_session_tokens(kw),
+                access_token=tokens["access_token"],
+                refresh_token=tokens.get("refresh_token", ""),
+                token_obtained_at=tokens.get("token_obtained_at", 0),
+                expires_in=tokens.get("expires_in", 7200),
+                # 关键：把 open_id 闭包进 callback，后台线程 refresh 后能写 store
+                on_token_refreshed=lambda **kw: _update_session_tokens(kw, _open_id),
             )
         except Exception as e:
             logger.warning(f"[Phase E] 创建 user_api 失败，回退 lark-cli: {e}")
@@ -3108,19 +3135,64 @@ def api_feishu_scan():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-def _update_session_tokens(token_info: dict):
-    """Token 刷新后更新 Flask session（跨线程需注意：session 只在请求上下文内有效）。
-    如果不在请求上下文内，静默跳过——token 已在 FeishuUserAPI 对象内更新。"""
+def _update_session_tokens(token_info: dict, open_id: str = ""):
+    """Token 刷新后写两处：
+      1) Flask session（仅在请求线程内有效；后台线程会跳过）
+      2) services.token_store（按 open_id 索引的 JSON 文件，所有线程可见）
+
+    open_id 必须传——后台线程没有 session，只能靠它写 store。
+    """
+    # 1) session — 只在请求上下文里写得动
     try:
         from flask import has_request_context
-        if not has_request_context():
-            return
-        session["user_access_token"] = token_info.get("access_token", "")
-        session["user_refresh_token"] = token_info.get("refresh_token", "")
-        session["token_expires_in"] = token_info.get("expires_in", 7200)
-        session["token_obtained_at"] = token_info.get("token_obtained_at", 0)
+        if has_request_context():
+            session["user_access_token"] = token_info.get("access_token", "")
+            session["user_refresh_token"] = token_info.get("refresh_token", "")
+            session["token_expires_in"] = token_info.get("expires_in", 7200)
+            session["token_obtained_at"] = token_info.get("token_obtained_at", 0)
     except Exception:
         pass
+
+    # 2) token_store — 后台线程也能写，是这次修复的关键
+    if open_id:
+        try:
+            from services import token_store
+            token_store.save(
+                open_id,
+                access_token=token_info.get("access_token", ""),
+                refresh_token=token_info.get("refresh_token", ""),
+                expires_in=token_info.get("expires_in", 7200),
+                token_obtained_at=token_info.get("token_obtained_at", 0),
+            )
+        except Exception as e:
+            logger.warning(f"[token_store] refresh 写入失败 (非致命): {e}")
+
+
+def _load_user_tokens() -> dict:
+    """读当前用户最新 token：先 store，后 session。
+    返回 {access_token, refresh_token, expires_in, token_obtained_at, open_id} 或 {}。
+    """
+    open_id = session.get("user_open_id", "")
+    # 优先读 store —— 后台线程刚 refresh 过的最新值在这
+    if open_id:
+        try:
+            from services import token_store
+            rec = token_store.load(open_id)
+            if rec and rec.get("access_token"):
+                rec["open_id"] = open_id
+                return rec
+        except Exception as e:
+            logger.warning(f"[token_store] 读取失败，回退 session: {e}")
+    # fallback: session
+    if session.get("user_access_token"):
+        return {
+            "access_token": session["user_access_token"],
+            "refresh_token": session.get("user_refresh_token", ""),
+            "expires_in": session.get("token_expires_in", 7200),
+            "token_obtained_at": session.get("token_obtained_at", 0),
+            "open_id": open_id,
+        }
+    return {}
 
 
 @app.route("/api/feishu_scan/<job_id>")
