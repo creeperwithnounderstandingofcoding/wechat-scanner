@@ -162,6 +162,10 @@ def login():
         "app_id": FEISHU_APP_ID,
         "redirect_uri": OAUTH_REDIRECT_URI,
         "state": state,
+        # 关键：申请"读群列表 + 读群消息"权限。缺这两个 scope 时，user_access_token
+        # 只能读身份，拉群消息会无权限 → 回退 bot client → bot 不在的群拉不到 → 静默空扫。
+        # （还需在飞书开放平台后台给应用开通 im:chat:readonly / im:message:readonly 权限）
+        "scope": "im:chat:readonly im:message:readonly",
     }
     authorize_url = (
         f"{FEISHU_OPEN_BASE}/open-apis/authen/v1/index?"

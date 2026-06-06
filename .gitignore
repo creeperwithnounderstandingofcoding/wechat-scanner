@@ -31,3 +31,4 @@ all_keys.json
 
 # Wiki (stored on server)
 wiki/
+.claude/
