@@ -79,10 +79,18 @@ def _bot_import_context():
         ):
             saved_bot_pkgs[key] = sys.modules.pop(key)
 
-    path_inserted = False
-    if bot_dir_str not in sys.path:
-        sys.path.insert(0, bot_dir_str)
-        path_inserted = True
+    # 强制把 bot 目录放到 sys.path 最前（关键修复）。
+    # 旧逻辑只在 bot_dir 不在 path 时才 insert(0)，但如果 bot_dir 已经在 path 里
+    # （排在 scanner 目录之后，例如别处 import 过 bot 模块留下的），insert 被跳过
+    # → `import services` 先命中 scanner 自己的 services 包 → 报
+    # "No module named 'services.deep_scan_pipeline'"（以及 feishu_user_read 等）。
+    had_bot_dir = bot_dir_str in sys.path
+    if had_bot_dir:
+        try:
+            sys.path.remove(bot_dir_str)
+        except ValueError:
+            pass
+    sys.path.insert(0, bot_dir_str)
 
     original_cwd = os.getcwd()
     try:
@@ -93,19 +101,29 @@ def _bot_import_context():
             os.chdir(original_cwd)
         except Exception:
             pass
-        if path_inserted:
-            try:
-                sys.path.remove(bot_dir_str)
-            except ValueError:
-                pass
+        # 撤掉我们插到最前的 bot_dir；若它本来就在 path 里，按原样补回末尾
+        try:
+            sys.path.remove(bot_dir_str)
+        except ValueError:
+            pass
+        if had_bot_dir and bot_dir_str not in sys.path:
+            sys.path.append(bot_dir_str)
         # 恢复 scanner 的 config（重要——后续 scanner 代码还要用）
         for name, mod in saved.items():
             if mod is not None:
                 sys.modules[name] = mod
             else:
                 sys.modules.pop(name, None)
-        # bot 的 services 等可以留在缓存里（下次复用），但如果和 saved_bot_pkgs
-        # 冲突，优先用刚加载的版本。这里不做恢复，避免把旧的带回来。
+        # 关键：清掉刚加载的 bot 版 services/utils/handlers，恢复 scanner 原本的，
+        # 否则 context 退出后 scanner 代码 import services.token_store / wiki_service
+        # 会拿到 bot 的包而失败。
+        for key in list(sys.modules.keys()):
+            if key in ("services", "utils", "handlers") or any(
+                key.startswith(p) for p in bot_pkg_prefixes
+            ):
+                sys.modules.pop(key, None)
+        for name, mod in saved_bot_pkgs.items():
+            sys.modules[name] = mod
 
 
 class BotBridge:
