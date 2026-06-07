@@ -3066,19 +3066,19 @@ def api_feishu_chats():
         tokens = _load_user_tokens()
         if tokens.get("access_token"):
             try:
-                import sys, os as _os
-                bot_dir = _os.getenv("FEISHU_DEAL_BOT_DIR", "")
-                if bot_dir and bot_dir not in sys.path:
-                    sys.path.insert(0, bot_dir)
-                from services.feishu_user_read import FeishuUserReader
+                # 必须用 bridge 的 _bot_import_context 才能正确 import bot 的 services.*
+                # （否则命中 scanner 自己的 services 包 → No module named services.feishu_user_read）
+                from bridge.bot_services import _bot_import_context
                 _open_id = tokens.get("open_id", "")
-                reader = FeishuUserReader(
-                    user_access_token=tokens["access_token"],
-                    refresh_token=tokens.get("refresh_token", ""),
-                    token_obtained_at=tokens.get("token_obtained_at", 0),
-                    expires_in=tokens.get("expires_in", 7200),
-                    on_token_refreshed=lambda **kw: _update_session_tokens(kw, _open_id),
-                )
+                with _bot_import_context():
+                    from services.feishu_user_read import FeishuUserReader
+                    reader = FeishuUserReader(
+                        user_access_token=tokens["access_token"],
+                        refresh_token=tokens.get("refresh_token", ""),
+                        token_obtained_at=tokens.get("token_obtained_at", 0),
+                        expires_in=tokens.get("expires_in", 7200),
+                        on_token_refreshed=lambda **kw: _update_session_tokens(kw, _open_id),
+                    )
                 raw_chats = reader.list_chats(page_size=100)
                 # 归一化字段，与 bot client 返回 shape 对齐
                 chats = [{
@@ -3115,20 +3115,20 @@ def api_feishu_scan():
     tokens = _load_user_tokens()
     if tokens.get("access_token"):
         try:
-            import sys, os
-            bot_dir = os.getenv("FEISHU_DEAL_BOT_DIR", "")
-            if bot_dir and bot_dir not in sys.path:
-                sys.path.insert(0, bot_dir)
-            from services.feishu_api import FeishuUserAPI
+            # 用 bridge 的 _bot_import_context 才能正确 import bot 的 services.feishu_api
+            # （否则命中 scanner 自己的 services 包 → No module named services.feishu_api → 回退 bot）
+            from bridge.bot_services import _bot_import_context
             _open_id = tokens.get("open_id", "")
-            user_api = FeishuUserAPI(
-                access_token=tokens["access_token"],
-                refresh_token=tokens.get("refresh_token", ""),
-                token_obtained_at=tokens.get("token_obtained_at", 0),
-                expires_in=tokens.get("expires_in", 7200),
-                # 关键：把 open_id 闭包进 callback，后台线程 refresh 后能写 store
-                on_token_refreshed=lambda **kw: _update_session_tokens(kw, _open_id),
-            )
+            with _bot_import_context():
+                from services.feishu_api import FeishuUserAPI
+                user_api = FeishuUserAPI(
+                    access_token=tokens["access_token"],
+                    refresh_token=tokens.get("refresh_token", ""),
+                    token_obtained_at=tokens.get("token_obtained_at", 0),
+                    expires_in=tokens.get("expires_in", 7200),
+                    # 关键：把 open_id 闭包进 callback，后台线程 refresh 后能写 store
+                    on_token_refreshed=lambda **kw: _update_session_tokens(kw, _open_id),
+                )
         except Exception as e:
             logger.warning(f"[Phase E] 创建 user_api 失败，回退 lark-cli: {e}")
 
