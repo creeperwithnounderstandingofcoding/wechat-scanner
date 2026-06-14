@@ -266,33 +266,17 @@ class BotBridge:
         client = self._ensure_client()
         with _bot_import_context():
             from services.deep_scan_pipeline import run_deep_scan  # noqa: E402
-            from services.feishu_user_read import FeishuUserReader  # noqa: E402
             from services.minutes_service import set_user_api, clear_user_api  # noqa: E402
 
-            user_reader = None
+            # 单一 token holder：把 web_ui 传来的 user_api 注入线程内，拉群消息 + 妙记逐字稿
+            # 都用同一个它（同一条 refresh 链路），避免之前两个对象各自刷新把单次有效的
+            # refresh_token 用废（飞书 20038 invalid refresh token）。
             if user_api is not None:
-                # 复用 user_api 上的 token 起一个 reader（不加 OAuth 流程，复用 session 里已有的 token）
-                try:
-                    user_reader = FeishuUserReader(
-                        user_access_token=getattr(user_api, "access_token", "") or "",
-                        refresh_token=getattr(user_api, "refresh_token", "") or "",
-                        token_obtained_at=getattr(user_api, "token_obtained_at", 0) or 0,
-                        expires_in=getattr(user_api, "expires_in", 7200) or 7200,
-                        on_token_refreshed=getattr(user_api, "on_token_refreshed", None),
-                    )
-                    set_user_api(user_api)
-                    logger.info("[Bridge] 启用 user_reader（不需要 bot 在群里）")
-                except Exception as e:
-                    logger.warning(f"[Bridge] user_reader 初始化失败，回退 bot client: {e}")
-                    user_reader = None
+                set_user_api(user_api)
+                logger.info("[Bridge] 启用 user_api 静默读群 + 妙记（不需要 bot 在群里）")
 
             try:
-                run_deep_scan(
-                    chat_id,
-                    progress_callback,
-                    user_reader=user_reader,
-                    bot_client=client,
-                )
+                run_deep_scan(chat_id, progress_callback, bot_client=client)
             except Exception as e:
                 logger.exception(f"[Bridge] 深度扫描 {chat_id} 异常: {e}")
                 progress_callback(f"❌ 扫描异常: {e}")
